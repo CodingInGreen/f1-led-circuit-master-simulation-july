@@ -1,4 +1,3 @@
-// main.rs
 mod led_coords;
 mod driver_info;
 
@@ -8,11 +7,11 @@ use reqwest::Client;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 use serde::ser::SerializeStruct;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::result::Result;
-use std::time::Instant;
-use tokio;
+use std::time::{Instant, Duration};
+use tokio::time::interval;
 use led_coords::{LedCoordinate, read_coordinates};
 use driver_info::{DriverInfo, get_driver_info};
 
@@ -84,9 +83,10 @@ where
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+#[derive(Clone)]
 struct PlotApp {
     update_rate_ms: u64,
-    frames: Vec<UpdateFrame>,
+    frames: VecDeque<UpdateFrame>,
     led_coordinates: Vec<LedCoordinate>,
     start_time: Instant,
     race_time: f64, // Elapsed race time in seconds
@@ -106,7 +106,7 @@ impl PlotApp {
     ) -> PlotApp {
         PlotApp {
             update_rate_ms,
-            frames,
+            frames: VecDeque::from(frames),
             led_coordinates,
             start_time: Instant::now(),
             race_time: 0.0,
@@ -158,6 +158,53 @@ impl PlotApp {
             }
         }
     }
+
+    async fn fetch_api_data(&mut self) -> Result<(), Box<dyn StdError>> {
+        let session_key = "9149";
+        let driver_numbers = vec![
+            1, 2, 4, 10, 11, 14, 16, 18, 20, 22, 23, 24, 27, 31, 40, 44, 55, 63, 77, 81,
+        ];
+        let start_time: &str = "2023-08-27T12:58:56.200";
+        let end_time: &str = "2023-08-27T13:20:54.300";
+
+        let client = Client::new();
+        let mut all_data: Vec<LocationData> = Vec::new();
+
+        for driver_number in driver_numbers {
+            let url = format!(
+                "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
+                session_key, driver_number, start_time, end_time,
+            );
+            let resp = client.get(&url).send().await?;
+            if resp.status().is_success() {
+                let data: Vec<LocationData> = resp.json().await?;
+                all_data.extend(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0));
+            } else {
+                eprintln!(
+                    "Failed to fetch data for driver {}: HTTP {}",
+                    driver_number,
+                    resp.status()
+                );
+            }
+        }
+
+        all_data.sort_by_key(|d| d.date);
+
+        let frames = generate_update_frames(&all_data, &self.led_coordinates);
+        self.frames.extend(frames);
+        Ok(())
+    }
+
+    async fn run_visualization(&mut self) {
+        let mut interval = interval(Duration::from_millis(self.update_rate_ms));
+        while self.race_started {
+            interval.tick().await;
+            self.update_race();
+            if !self.frames.is_empty() {
+                self.frames.pop_front();
+            }
+        }
+    }
 }
 
 impl App for PlotApp {
@@ -201,6 +248,12 @@ impl App for PlotApp {
                     self.start_time = Instant::now();
                     self.current_index = 0;
                     self.led_states.clear(); // Clear LED states when race starts
+
+                    let mut app_clone = self.clone();
+                    tokio::spawn(async move {
+                        app_clone.fetch_api_data().await.unwrap();
+                        app_clone.run_visualization().await;
+                    });
                 }
                 if ui.button("STOP").clicked() {
                     self.reset();
@@ -269,64 +322,6 @@ impl App for PlotApp {
     }
 }
 
-fn main() -> Result<(), Box<dyn StdError>> {
-    let coordinates = read_coordinates()?; // Unwrap the result here
-
-    // Initialize the runtime for async execution
-    let runtime = tokio::runtime::Runtime::new()?;
-    let raw_data = runtime.block_on(fetch_data())?;
-
-    let frames = generate_update_frames(&raw_data, &coordinates);
-    let driver_info = get_driver_info();
-
-    let update_rate_ms = 100; // Assuming update rate is 100 ms as in the previous code
-    let app = PlotApp::new(update_rate_ms, frames, coordinates, driver_info);
-
-    let native_options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "F1-LED-CIRCUIT SIMULATION",
-        native_options,
-        Box::new(|_cc| Box::new(app)),
-    )?;
-
-    Ok(())
-}
-
-async fn fetch_data() -> Result<Vec<LocationData>, Box<dyn StdError>> {
-    let session_key = "9149";
-    let driver_numbers = vec![
-        1, 2, 4, 10, 11, 14, 16, 18, 20, 22, 23, 24, 27, 31, 40, 44, 55, 63, 77, 81,
-    ];
-    let start_time: &str = "2023-08-27T12:58:56.200";
-    let end_time: &str = "2023-08-27T13:20:54.300";
-
-    let client = Client::new();
-    let mut all_data: Vec<LocationData> = Vec::new();
-
-    for driver_number in driver_numbers {
-        let url = format!(
-            "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
-            session_key, driver_number, start_time, end_time,
-        );
-        eprint!("url: {}", url);
-        let resp = client.get(&url).send().await?;
-        if resp.status().is_success() {
-            let data: Vec<LocationData> = resp.json().await?;
-            all_data.extend(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0));
-        } else {
-            eprintln!(
-                "Failed to fetch data for driver {}: HTTP {}",
-                driver_number,
-                resp.status()
-            );
-        }
-    }
-
-    // Sort the data by the date field
-    all_data.sort_by_key(|d| d.date);
-    Ok(all_data)
-}
-
 fn generate_update_frames(
     raw_data: &[LocationData],
     coordinates: &[LedCoordinate],
@@ -379,4 +374,21 @@ fn generate_update_frames(
     }
 
     frames
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn StdError>> {
+    let coordinates = read_coordinates()?;
+    let driver_info = get_driver_info();
+
+    let app = PlotApp::new(100, vec![], coordinates, driver_info);
+
+    let native_options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "F1-LED-CIRCUIT SIMULATION",
+        native_options,
+        Box::new(|_cc| Box::new(app)),
+    )?;
+
+    Ok(())
 }
