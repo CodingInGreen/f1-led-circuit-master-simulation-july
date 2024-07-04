@@ -1,6 +1,6 @@
 use eframe::egui;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DriverInfo {
     pub number: u32,
     pub name: &'static str,
