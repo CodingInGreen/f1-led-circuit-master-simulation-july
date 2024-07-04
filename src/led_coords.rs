@@ -1,4 +1,3 @@
-// led_coords.rs
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 
