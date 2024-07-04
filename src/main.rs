@@ -15,6 +15,8 @@ use std::result::Result;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio;
+use tokio::sync::mpsc;
+use tokio::time::interval;
 use led_coords::{LedCoordinate, read_coordinates};
 use driver_info::{DriverInfo, get_driver_info};
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,7 +97,7 @@ struct RaceData {
 #[derive(Clone)]
 struct PlotApp {
     update_rate_ms: u64,
-    frames: Vec<UpdateFrame>,
+    frames: Arc<Mutex<Vec<UpdateFrame>>>,
     led_coordinates: Vec<LedCoordinate>,
     start_time: Instant,
     race_time: f64,
@@ -107,9 +109,10 @@ struct PlotApp {
     last_visualized_index: usize,
     led_states: Arc<Mutex<HashMap<usize, egui::Color32>>>,
     speed: i32,
-    completion_sender: Option<async_channel::Sender<()>>,
-    completion_receiver: Option<async_channel::Receiver<()>>,
+    completion_sender: Option<mpsc::Sender<()>>,
+    completion_receiver: Option<mpsc::Receiver<()>>,
 }
+
 
 impl PlotApp {
     fn new(
@@ -118,10 +121,10 @@ impl PlotApp {
         led_coordinates: Vec<LedCoordinate>,
         driver_info: Vec<DriverInfo>,
     ) -> PlotApp {
-        let (completion_sender, completion_receiver) = async_channel::bounded(1);
+        let (completion_sender, completion_receiver) = mpsc::channel(1);
         PlotApp {
             update_rate_ms,
-            frames,
+            frames: Arc::new(Mutex::new(frames)),
             led_coordinates,
             start_time: Instant::now(),
             race_time: 0.0,
@@ -187,6 +190,13 @@ impl PlotApp {
         ];
 
         let mut all_drivers_complete = false;
+        let frames = self.frames.clone();
+
+        let session_key = "9149";
+        let start_time: &str = "2023-08-27T12:58:56.200";
+        let end_time: &str = "2023-08-27T13:20:54.300";
+        
+        let mut all_drivers_complete = false;
 
         while !all_drivers_complete {
             let mut handles = Vec::new();
@@ -194,53 +204,50 @@ impl PlotApp {
 
             for &driver_number in &driver_numbers {
                 let url = format!(
-                    "https://api.openf1.org/v1/location?session_key={}&driver_number={}",
-                    "9149", driver_number
+                    "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
+                    session_key, driver_number, start_time, end_time,
                 );
 
-                let mut app_clone = self.clone();
                 let sender_clone = self.completion_sender.clone().unwrap();
                 handles.push(tokio::spawn(async move {
                     let mut stream = fetch_data_in_chunks(&url, 8 * 1024).await?;
                     let mut buffer = Vec::new();
                     let mut driver_complete = true;
-
+    
                     while let Some(chunk) = stream.next().await {
                         let chunk = chunk?;
-                        let run_race_data = deserialize_chunk(
+                        let new_frames = deserialize_chunk(
                             chunk,
                             &mut buffer,
-                            &app_clone.led_coordinates,
+                            &frames.lock().unwrap(),
                             usize::MAX,
                             &sender_clone,
                         ).await?;
-
-                        app_clone.frames.extend(run_race_data);
-                        app_clone.frames.sort_by_key(|d| d.drivers[0].as_ref().unwrap().driver_number);
-
-                        app_clone.update_race();
-
+    
+                        frames.lock().unwrap().extend(new_frames);
+                        frames.lock().unwrap().sort_by_key(|d| d.drivers[0].as_ref().unwrap().driver_number);
+    
                         if !buffer.is_empty() {
                             driver_complete = false;
                         }
                     }
-
+    
                     if driver_complete {
                         println!("Completed data fetching for driver number {}", driver_number);
                     }
-
+    
                     Ok::<(), Box<dyn StdError + Send + Sync>>(())
                 }));
             }
-
+    
             let results = future::join_all(handles).await;
-
+    
             for result in results {
                 if let Err(e) = result {
                     eprintln!("Error fetching data: {:?}", e);
                 }
             }
-
+    
             for driver_number in &driver_numbers {
                 let data_complete = Self::check_if_data_complete(driver_number).await;
                 if !data_complete {
@@ -248,16 +255,16 @@ impl PlotApp {
                 }
             }
         }
-
+    
         println!("Finished streaming data for all drivers");
         self.data_loaded = true;
-
+    
         if let Some(sender) = &self.completion_sender {
             println!("Sending final completion message...");
             let _ = sender.send(()).await;
             println!("Final completion message sent.");
         }
-
+    
         Ok(())
     }
 
@@ -467,7 +474,7 @@ async fn deserialize_chunk(
     buffer: &mut Vec<u8>,
     coordinates: &[LedCoordinate],
     max_rows: usize,
-    sender: &async_channel::Sender<()>,
+    sender: &mpsc::Sender<()>,
 ) -> Result<Vec<UpdateFrame>, Box<dyn StdError + Send + Sync>> {
     buffer.extend_from_slice(&chunk);
 
@@ -527,12 +534,27 @@ async fn deserialize_chunk(
     Ok(run_race_data)
 }
 
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
     let coordinates = read_coordinates()?;
     let driver_info = get_driver_info();
 
     let app = PlotApp::new(100, vec![], coordinates, driver_info);
+
+    let frames = app.frames.clone();
+    let update_rate_ms = app.update_rate_ms;
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_millis(update_rate_ms));
+        loop {
+            interval.tick().await;
+            let mut frames_guard = frames.lock().unwrap();
+            if !frames_guard.is_empty() {
+                // Process the frames here
+                // ...
+            }
+        }
+    });
 
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
