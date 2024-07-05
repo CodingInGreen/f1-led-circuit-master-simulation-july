@@ -12,7 +12,6 @@ use std::error::Error as StdError;
 use std::result::Result;
 use std::time::{Instant, Duration};
 use tokio::time::{interval, sleep};
-use tokio::runtime::Runtime;
 use led_coords::{LedCoordinate, read_coordinates};
 use driver_info::{DriverInfo, get_driver_info};
 
@@ -147,7 +146,7 @@ impl PlotApp {
     fn update_led_states(&mut self) {
         self.led_states.clear();
 
-        if self.current_index > 0 {
+        if self.current_index > 0 && self.current_index <= self.frames.len() {
             let frame = &self.frames[self.current_index - 1];
 
             for driver_data in &frame.drivers {
@@ -221,13 +220,6 @@ impl PlotApp {
                     );
                 }
                 current_start_time = current_end_time;
-                if all_data.len() >= 100 {
-                    break; // Stop if we have fetched at least 100 entries
-                }
-            }
-            if all_data.len() >= 100 {
-                println!("Truncated data for driver {}: {} entries", driver_number, all_data.len());
-                break; // Only process one driver at a time for simplicity
             }
         }
     
@@ -237,6 +229,7 @@ impl PlotApp {
         self.frames.extend(frames);
         Ok(())
     }
+    
     
 
     async fn run_visualization(&mut self) {
@@ -396,19 +389,31 @@ fn generate_update_frames(
         };
 
         // Insert the driver data into the frame
+        let mut inserted = false;
         for slot in frame.drivers.iter_mut() {
             if slot.is_none() {
                 *slot = Some(driver_data);
+                inserted = true;
                 break;
             }
         }
 
-        // Once the frame is full, push it to the frames vector and start a new frame
-        if frame.drivers.iter().all(|slot| slot.is_some()) {
+        // If the frame is full, push it to the frames vector and start a new frame
+        if !inserted || frame.drivers.iter().all(|slot| slot.is_some()) {
             frames.push(frame);
             frame = UpdateFrame {
                 drivers: [None; 20],
             };
+
+            // Ensure the new frame includes the driver data if it wasn't inserted
+            if !inserted {
+                for slot in frame.drivers.iter_mut() {
+                    if slot.is_none() {
+                        *slot = Some(driver_data);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -419,6 +424,7 @@ fn generate_update_frames(
 
     frames
 }
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
