@@ -168,7 +168,8 @@ impl PlotApp {
         
         // Validate the initial start time and end time strings
         let initial_start_time_str = "2023-08-27T12:58:56.200Z";
-        let end_time_str = "2023-08-27T13:20:54.300Z";
+        let end_time_str = "2023-08-27T12:58:57.674Z"; // rate limit test
+        // let end_time_str = "2023-08-27T13:20:54.300Z"; actual sample
         
         // Log the input strings for verification
         println!("Parsing initial_start_time_str: {}", initial_start_time_str);
@@ -186,39 +187,76 @@ impl PlotApp {
     
         let client = Client::new();
         let mut all_data: Vec<LocationData> = Vec::new();
+        let mut api_calls = 0;
     
         for driver_number in driver_numbers {
             let mut current_start_time = initial_start_time;
             while current_start_time < end_time {
+                if api_calls >= 3 {
+                    // Reset the API call count after waiting for 1 minute
+                    println!("Rate limit reached, waiting for 1 minute...");
+                    sleep(Duration::from_secs(60)).await;
+                    api_calls = 0;
+                }
+    
                 let current_end_time = current_start_time + time_window;
                 println!("Fetching data for driver {} from {} to {}", driver_number, current_start_time, current_end_time);
                 let url = format!(
                     "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
                     session_key, driver_number, current_start_time.to_rfc3339(), current_end_time.to_rfc3339(),
                 );
-                let resp = client.get(&url).send().await?;
-                if resp.status().is_success() {
-                    let data: Vec<LocationData> = resp.json().await?;
-                    println!("Fetched {} entries for driver {} from {} to {}", data.len(), driver_number, current_start_time, current_end_time);
-                    if !data.is_empty() {
-                        all_data.extend(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0));
+    
+                let mut retry_count = 0;
+                let mut success = false;
+    
+                while retry_count < 6 && !success {
+                    let resp = client.get(&url).send().await?;
+                    if resp.status().is_success() {
+                        let data: Vec<LocationData> = resp.json().await?;
+                        println!("Fetched {} entries for driver {} from {} to {}", data.len(), driver_number, current_start_time, current_end_time);
+                        if !data.is_empty() {
+                            all_data.extend(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0));
+                        } else {
+                            break; // Stop if no data is returned
+                        }
+                        success = true;
+                    } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        eprintln!(
+                            "Failed to fetch data for driver {}: HTTP {} Too Many Requests",
+                            driver_number,
+                            resp.status()
+                        );
+                        retry_count += 1;
+                        let backoff_time = match retry_count {
+                            1 => Duration::from_secs(4),
+                            2 => Duration::from_secs(6),
+                            3 => Duration::from_secs(8),
+                            4 => Duration::from_secs(16),
+                            5 => Duration::from_secs(32),
+                            _ => Duration::from_secs(64),
+                        };
+                        eprintln!("Retrying in {:?} seconds...", backoff_time);
+                        sleep(backoff_time).await; // Exponential backoff
                     } else {
-                        break; // Stop if no data is returned
+                        eprintln!(
+                            "Failed to fetch data for driver {}: HTTP {}",
+                            driver_number,
+                            resp.status()
+                        );
+                        break;
                     }
-                } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    eprintln!(
-                        "Failed to fetch data for driver {}: HTTP {}",
-                        driver_number,
-                        resp.status()
-                    );
-                    sleep(Duration::from_secs(1)).await; // Sleep to avoid hitting the rate limit
-                } else {
-                    eprintln!(
-                        "Failed to fetch data for driver {}: HTTP {}",
-                        driver_number,
-                        resp.status()
-                    );
                 }
+    
+                if !success {
+                    eprintln!(
+                        "Failed to fetch data for driver {} after {} retries",
+                        driver_number,
+                        retry_count
+                    );
+                } else {
+                    api_calls += 1;
+                }
+    
                 current_start_time = current_end_time;
             }
         }
