@@ -306,8 +306,8 @@ async fn fetch_data() -> Result<Vec<LocationData>, Box<dyn StdError>> {
     let mut all_data: Vec<LocationData> = Vec::new();
     
     // Define the chunk size in seconds and the step interval for each chunk
-    let chunk_size_secs = 60; // Fetch 1 minute of data per chunk
-    let step_interval_secs = 60; // Move by 1 minute each iteration
+    let chunk_size_secs = 180; // Fetch 3 minute of data per chunk
+    let step_interval_secs = 180; // Move by 3 minute each iteration
 
     let start_time = DateTime::parse_from_rfc3339(start_time_str)?.with_timezone(&Utc);
     let end_time = DateTime::parse_from_rfc3339(end_time_str)?.with_timezone(&Utc);
