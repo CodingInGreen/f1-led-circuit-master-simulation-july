@@ -1,7 +1,7 @@
 mod led_coords;
 mod driver_info;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Duration as ChronoDuration};
 use eframe::{egui, App, Frame};
 use reqwest::Client;
 use serde::de::{self, Deserializer};
@@ -11,7 +11,8 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::result::Result;
 use std::time::{Instant, Duration};
-use tokio::time::interval;
+use tokio::time::{interval, sleep};
+use tokio::runtime::Runtime;
 use led_coords::{LedCoordinate, read_coordinates};
 use driver_info::{DriverInfo, get_driver_info};
 
@@ -97,6 +98,7 @@ struct PlotApp {
     speed: i32, // Playback speed multiplier
 }
 
+
 impl PlotApp {
     fn new(
         update_rate_ms: u64,
@@ -164,27 +166,53 @@ impl PlotApp {
         let driver_numbers = vec![
             1, 2, 4, 10, 11, 14, 16, 18, 20, 22, 23, 24, 27, 31, 40, 44, 55, 63, 77, 81,
         ];
-        let start_time: &str = "2023-08-27T12:58:56.200";
-        let end_time: &str = "2023-08-27T13:20:54.300";
+        let initial_start_time = DateTime::parse_from_rfc3339("2023-08-27T12:58:56.200")?.with_timezone(&Utc);
+        let end_time = DateTime::parse_from_rfc3339("2023-08-27T13:20:54.300")?.with_timezone(&Utc);
+        let time_window = ChronoDuration::seconds(1); // Adjust this value to control the size of the fetched chunk
 
         let client = Client::new();
         let mut all_data: Vec<LocationData> = Vec::new();
 
         for driver_number in driver_numbers {
-            let url = format!(
-                "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
-                session_key, driver_number, start_time, end_time,
-            );
-            let resp = client.get(&url).send().await?;
-            if resp.status().is_success() {
-                let data: Vec<LocationData> = resp.json().await?;
-                all_data.extend(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0));
-            } else {
-                eprintln!(
-                    "Failed to fetch data for driver {}: HTTP {}",
-                    driver_number,
-                    resp.status()
+            let mut current_start_time = initial_start_time;
+            while current_start_time < end_time {
+                let current_end_time = current_start_time + time_window;
+                println!("Fetching data for driver {} from {} to {}", driver_number, current_start_time, current_end_time);
+                let url = format!(
+                    "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
+                    session_key, driver_number, current_start_time.to_rfc3339(), current_end_time.to_rfc3339(),
                 );
+                let resp = client.get(&url).send().await?;
+                if resp.status().is_success() {
+                    let data: Vec<LocationData> = resp.json().await?;
+                    println!("Fetched {} entries for driver {} from {} to {}", data.len(), driver_number, current_start_time, current_end_time);
+                    if !data.is_empty() {
+                        all_data.extend(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0));
+                    } else {
+                        break; // Stop if no data is returned
+                    }
+                } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    eprintln!(
+                        "Failed to fetch data for driver {}: HTTP {}",
+                        driver_number,
+                        resp.status()
+                    );
+                    sleep(Duration::from_secs(1)).await; // Sleep to avoid hitting the rate limit
+                } else {
+                    eprintln!(
+                        "Failed to fetch data for driver {}: HTTP {}",
+                        driver_number,
+                        resp.status()
+                    );
+                }
+                current_start_time = current_end_time;
+                if all_data.len() >= 100 {
+                    break; // Stop if we have fetched at least 100 entries
+                }
+            }
+            if all_data.len() >= 100 {
+                println!("Truncated data for driver {}: {} entries", driver_number, all_data.len());
+                break; // Only process one driver at a time for simplicity
             }
         }
 
