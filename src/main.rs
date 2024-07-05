@@ -166,13 +166,28 @@ impl PlotApp {
         let driver_numbers = vec![
             1, 2, 4, 10, 11, 14, 16, 18, 20, 22, 23, 24, 27, 31, 40, 44, 55, 63, 77, 81,
         ];
-        let initial_start_time = DateTime::parse_from_rfc3339("2023-08-27T12:58:56.200")?.with_timezone(&Utc);
-        let end_time = DateTime::parse_from_rfc3339("2023-08-27T13:20:54.300")?.with_timezone(&Utc);
+        
+        // Validate the initial start time and end time strings
+        let initial_start_time_str = "2023-08-27T12:58:56.200Z";
+        let end_time_str = "2023-08-27T13:20:54.300Z";
+        
+        // Log the input strings for verification
+        println!("Parsing initial_start_time_str: {}", initial_start_time_str);
+        println!("Parsing end_time_str: {}", end_time_str);
+        
+        let initial_start_time = DateTime::parse_from_rfc3339(initial_start_time_str)
+            .map_err(|e| format!("Failed to parse initial_start_time: {}", e))?
+            .with_timezone(&Utc);
+        
+        let end_time = DateTime::parse_from_rfc3339(end_time_str)
+            .map_err(|e| format!("Failed to parse end_time: {}", e))?
+            .with_timezone(&Utc);
+    
         let time_window = ChronoDuration::seconds(1); // Adjust this value to control the size of the fetched chunk
-
+    
         let client = Client::new();
         let mut all_data: Vec<LocationData> = Vec::new();
-
+    
         for driver_number in driver_numbers {
             let mut current_start_time = initial_start_time;
             while current_start_time < end_time {
@@ -215,13 +230,14 @@ impl PlotApp {
                 break; // Only process one driver at a time for simplicity
             }
         }
-
+    
         all_data.sort_by_key(|d| d.date);
-
+    
         let frames = generate_update_frames(&all_data, &self.led_coordinates);
         self.frames.extend(frames);
         Ok(())
     }
+    
 
     async fn run_visualization(&mut self) {
         let mut interval = interval(Duration::from_millis(self.update_rate_ms));
