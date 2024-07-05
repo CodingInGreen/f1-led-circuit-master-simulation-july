@@ -2,7 +2,7 @@
 mod led_coords;
 mod driver_info;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use eframe::{egui, App, Frame};
 use reqwest::Client;
 use serde::de::{self, Deserializer};
@@ -13,6 +13,8 @@ use std::error::Error as StdError;
 use std::result::Result;
 use std::time::Instant;
 use tokio;
+use futures::stream;
+use futures::StreamExt;
 use led_coords::{LedCoordinate, read_coordinates};
 use driver_info::{DriverInfo, get_driver_info};
 
@@ -297,35 +299,63 @@ async fn fetch_data() -> Result<Vec<LocationData>, Box<dyn StdError>> {
     let driver_numbers = vec![
         1, 2, 4, 10, 11, 14, 16, 18, 20, 22, 23, 24, 27, 31, 40, 44, 55, 63, 77, 81,
     ];
-    let start_time: &str = "2023-08-27T12:58:56.200";
-    let end_time: &str = "2023-08-27T13:20:54.300";
+    let start_time_str = "2023-08-27T12:58:56.200Z";
+    let end_time_str = "2023-08-27T13:20:54.300Z";
 
     let client = Client::new();
     let mut all_data: Vec<LocationData> = Vec::new();
+    
+    // Define the chunk size in seconds and the step interval for each chunk
+    let chunk_size_secs = 60; // Fetch 1 minute of data per chunk
+    let step_interval_secs = 60; // Move by 1 minute each iteration
 
-    for driver_number in driver_numbers {
-        let url = format!(
-            "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
-            session_key, driver_number, start_time, end_time,
-        );
-        eprint!("url: {}", url);
-        let resp = client.get(&url).send().await?;
-        if resp.status().is_success() {
-            let data: Vec<LocationData> = resp.json().await?;
-            all_data.extend(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0));
-        } else {
-            eprintln!(
-                "Failed to fetch data for driver {}: HTTP {}",
-                driver_number,
-                resp.status()
+    let start_time = DateTime::parse_from_rfc3339(start_time_str)?.with_timezone(&Utc);
+    let end_time = DateTime::parse_from_rfc3339(end_time_str)?.with_timezone(&Utc);
+
+    let mut current_start_time = start_time;
+
+    while current_start_time < end_time {
+        let current_end_time = (current_start_time + Duration::seconds(chunk_size_secs)).min(end_time);
+
+        println!("Fetching data from {} to {}", current_start_time, current_end_time); // Debug
+
+        let tasks: Vec<_> = driver_numbers.iter().map(|&driver_number| {
+            let client = &client;
+            let url = format!(
+                "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
+                session_key, driver_number, current_start_time.to_rfc3339(), current_end_time.to_rfc3339(),
             );
+            async move {
+                let resp = client.get(&url).send().await;
+                match resp {
+                    Ok(resp) if resp.status().is_success() => {
+                        let data: Vec<LocationData> = resp.json().await.unwrap_or_else(|_| vec![]);
+                        Some(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                }
+            }
+        }).collect();
+
+        let results = stream::iter(tasks).buffer_unordered(10).collect::<Vec<_>>().await;
+
+        for result in results {
+            if let Some(data) = result {
+                println!("Fetched {} entries for a driver", data.len()); // Debug
+                all_data.extend(data);
+            }
         }
+
+        println!("Total data size: {}", all_data.len()); // Debug
+
+        current_start_time = current_start_time + Duration::seconds(step_interval_secs);
     }
 
     // Sort the data by the date field
     all_data.sort_by_key(|d| d.date);
     Ok(all_data)
 }
+
 
 fn generate_update_frames(
     raw_data: &[LocationData],
