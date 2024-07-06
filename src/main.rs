@@ -336,17 +336,6 @@ impl Application for PlotApp {
     }
 }
 
-impl iced::widget::container::StyleSheet for ContainerStyle {
-    type Style = iced::Theme;
-
-    fn appearance(&self, _style: &Self::Style) -> iced::widget::container::Appearance {
-        iced::widget::container::Appearance {
-            background: Some(iced::Background::Color(self.color)),
-            ..Default::default()
-        }
-    }
-}
-
 fn generate_update_frames(raw_data: &[LocationData], coordinates: &[LedCoordinate]) -> Vec<UpdateFrame> {
     let mut frames: Vec<UpdateFrame> = vec![];
     let mut timestamp_map: HashMap<DateTime<Utc>, Vec<LocationData>> = HashMap::new();
