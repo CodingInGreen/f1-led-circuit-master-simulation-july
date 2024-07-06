@@ -6,7 +6,7 @@ use driver_info::{get_driver_info, DriverInfo};
 use iced::{
     executor, Application, Command, Element, Length, Settings, Subscription, Theme,
 };
-use iced::widget::{button, column, container, row, slider, text};
+use iced::widget::{column, container};
 use iced::time;
 use led_coords::{read_coordinates, LedCoordinate};
 use reqwest::Client;
@@ -270,6 +270,10 @@ impl Application for PlotApp {
 
     type Theme = iced::Theme;
 
+    fn theme(&self) -> Self::Theme {
+        Theme::Dracula
+    }
+
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::StartRace => {
@@ -299,25 +303,7 @@ impl Application for PlotApp {
     }
 
     fn view(&self) -> Element<Message> {
-        let content = column![
-            row![
-                button("Start").on_press(Message::StartRace),
-                button("Stop").on_press(Message::StopRace),
-                text(format!(
-                    "Race Time: {:02}:{:02}:{:05.2}",
-                    (self.race_time / 3600.0).floor() as u32,
-                    ((self.race_time % 3600.0) / 60.0).floor() as u32,
-                    self.race_time % 60.0
-                )),
-                text("Playback Speed:"),
-                slider(1..=5, self.speed, Message::SpeedChanged)
-            ],
-            text("Driver Info:"),
-            text("LED Display:"),
-            text(if self.race_started { "Race started!" } else { "Race stopped." }),
-            text(format!("Current speed: {}", self.speed))
-        ]
-        .into();
+        let content: Element<Message> = column![].into();
 
         container(content)
             .width(Length::Fill)
