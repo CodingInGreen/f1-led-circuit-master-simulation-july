@@ -133,7 +133,7 @@ impl PlotApp {
         if !self.data_fetched {
             return;
         }
-
+    
         println!("Updating race...");
     
         if self.race_started {
@@ -141,21 +141,31 @@ impl PlotApp {
             self.race_time = elapsed * self.speed as f64;
     
             let frame_duration = self.update_rate_ms as f64 / 1000.0;
-            let mut next_index = self.current_index;
-            while next_index < self.frames.len() && next_index as f64 * frame_duration <= self.race_time {
-                next_index += 1;
+            let next_index = (self.race_time / frame_duration).floor() as usize;
+    
+            if next_index >= self.frames.len() {
+                self.current_index = self.frames.len().saturating_sub(1); // Ensure it does not exceed frames length
+            } else {
+                self.current_index = next_index;
             }
     
-            self.current_index = next_index;
-            self.update_led_states();
+            println!("Current index: {}, Next index: {}", self.current_index, next_index);
+    
+            // If current_index is 0 and we should continue processing
+            if self.current_index == 0 && self.frames.is_empty() {
+                println!("Warning: current index ({}) is 0", self.current_index);
+            } else {
+                self.update_led_states();
+            }
         }
     }
-
+    
     fn update_led_states(&mut self) {
         self.led_states.clear();
     
-        if self.current_index > 0 && self.current_index <= self.frames.len() {
-            let frame = &self.frames[self.current_index - 1];
+        if self.current_index < self.frames.len() {
+            let frame = &self.frames[self.current_index];
+            println!("Processing frame: {:?}", frame);
     
             for driver_data in &frame.drivers {
                 if let Some(driver) = driver_data {
@@ -165,6 +175,8 @@ impl PlotApp {
                     self.led_states.insert(driver.led_num, color);
                 }
             }
+        } else {
+            println!("Skipping update as current_index is out of bounds");
         }
     
         // Debug statement to print the LED states
@@ -195,7 +207,7 @@ impl PlotApp {
             .with_timezone(&Utc);
     
         // Each API call should cover a time window of 0.35 seconds
-        let time_window = ChronoDuration::milliseconds(450);
+        let time_window = ChronoDuration::milliseconds(1001);
     
         let client = Client::new();
         let mut all_data: Vec<LocationData> = Vec::new();
@@ -277,6 +289,7 @@ impl PlotApp {
     
         Ok(())
     }
+    
     
     
 
