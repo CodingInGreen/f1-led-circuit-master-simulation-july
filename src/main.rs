@@ -183,22 +183,15 @@ impl PlotApp {
             .map_err(|e| format!("Failed to parse end_time: {}", e))?
             .with_timezone(&Utc);
     
-        let time_window = ChronoDuration::seconds(1); // Adjust this value to control the size of the fetched chunk
+        // Each API call should cover a time window of 0.35 seconds
+        let time_window = ChronoDuration::milliseconds(350);
     
         let client = Client::new();
         let mut all_data: Vec<LocationData> = Vec::new();
-        let mut api_calls = 0;
     
         for driver_number in driver_numbers {
             let mut current_start_time = initial_start_time;
             while current_start_time < end_time {
-                if api_calls >= 3 {
-                    // Reset the API call count after waiting for 1 minute
-                    println!("Rate limit reached, waiting for 1 minute...");
-                    sleep(Duration::from_secs(60)).await;
-                    api_calls = 0;
-                }
-    
                 let current_end_time = current_start_time + time_window;
                 println!("Fetching data for driver {} from {} to {}", driver_number, current_start_time, current_end_time);
                 let url = format!(
@@ -228,14 +221,14 @@ impl PlotApp {
                         );
                         retry_count += 1;
                         let backoff_time = match retry_count {
-                            1 => Duration::from_secs(4),
-                            2 => Duration::from_secs(6),
+                            1 => Duration::from_secs(2),
+                            2 => Duration::from_secs(4),
                             3 => Duration::from_secs(8),
                             4 => Duration::from_secs(16),
                             5 => Duration::from_secs(32),
                             _ => Duration::from_secs(64),
                         };
-                        eprintln!("Retrying in {:?} seconds...", backoff_time);
+                        eprintln!("Retrying in {:?}...", backoff_time);
                         sleep(backoff_time).await; // Exponential backoff
                     } else {
                         eprintln!(
@@ -253,8 +246,6 @@ impl PlotApp {
                         driver_number,
                         retry_count
                     );
-                } else {
-                    api_calls += 1;
                 }
     
                 current_start_time = current_end_time;
@@ -265,6 +256,11 @@ impl PlotApp {
     
         let frames = generate_update_frames(&all_data, &self.led_coordinates);
         self.frames.extend(frames);
+    
+        // Print statement indicating all data has been fetched and dump data contents
+        println!("All data has been successfully fetched.");
+        println!("Data contents: {:#?}", all_data);
+    
         Ok(())
     }
     
