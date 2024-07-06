@@ -15,7 +15,7 @@ use tokio::time::{interval, sleep};
 use led_coords::{LedCoordinate, read_coordinates};
 use driver_info::{DriverInfo, get_driver_info};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocationData {
     x: f64,
     y: f64,
@@ -95,6 +95,7 @@ struct PlotApp {
     current_index: usize,
     led_states: HashMap<usize, egui::Color32>, // Tracks the current state of the LEDs
     speed: i32, // Playback speed multiplier
+    data_fetched: bool, // Indicates whether data fetching is complete
 }
 
 
@@ -116,6 +117,7 @@ impl PlotApp {
             current_index: 0,
             led_states: HashMap::new(), // Initialize empty LED state tracking
             speed: 1,
+            data_fetched: false, // Initialize to false
         }
     }
 
@@ -128,16 +130,22 @@ impl PlotApp {
     }
 
     fn update_race(&mut self) {
+        if !self.data_fetched {
+            return;
+        }
+
+        println!("Updating race...");
+    
         if self.race_started {
             let elapsed = self.start_time.elapsed().as_secs_f64();
             self.race_time = elapsed * self.speed as f64;
-
+    
             let frame_duration = self.update_rate_ms as f64 / 1000.0;
             let mut next_index = self.current_index;
             while next_index < self.frames.len() && next_index as f64 * frame_duration <= self.race_time {
                 next_index += 1;
             }
-
+    
             self.current_index = next_index;
             self.update_led_states();
         }
@@ -145,10 +153,10 @@ impl PlotApp {
 
     fn update_led_states(&mut self) {
         self.led_states.clear();
-
+    
         if self.current_index > 0 && self.current_index <= self.frames.len() {
             let frame = &self.frames[self.current_index - 1];
-
+    
             for driver_data in &frame.drivers {
                 if let Some(driver) = driver_data {
                     let color = self.driver_info.iter()
@@ -158,6 +166,9 @@ impl PlotApp {
                 }
             }
         }
+    
+        // Debug statement to print the LED states
+        println!("LED States: {:?}", self.led_states);
     }
 
     async fn fetch_api_data(&mut self) -> Result<(), Box<dyn StdError>> {
@@ -184,7 +195,7 @@ impl PlotApp {
             .with_timezone(&Utc);
     
         // Each API call should cover a time window of 0.35 seconds
-        let time_window = ChronoDuration::milliseconds(350);
+        let time_window = ChronoDuration::milliseconds(450);
     
         let client = Client::new();
         let mut all_data: Vec<LocationData> = Vec::new();
@@ -254,12 +265,15 @@ impl PlotApp {
     
         all_data.sort_by_key(|d| d.date);
     
-        let frames = generate_update_frames(&all_data, &self.led_coordinates);
-        self.frames.extend(frames);
-    
         // Print statement indicating all data has been fetched and dump data contents
         println!("All data has been successfully fetched.");
         println!("Data contents: {:#?}", all_data);
+    
+        let frames = generate_update_frames(&all_data, &self.led_coordinates);
+        self.frames.extend(frames);
+    
+        // Set data_fetched to true after fetching is complete
+        self.data_fetched = true;
     
         Ok(())
     }
@@ -267,6 +281,7 @@ impl PlotApp {
     
 
     async fn run_visualization(&mut self) {
+        println!("Running Visualization...");
         let mut interval = interval(Duration::from_millis(self.update_rate_ms));
         while self.race_started {
             interval.tick().await;
@@ -319,13 +334,20 @@ impl App for PlotApp {
                     self.start_time = Instant::now();
                     self.current_index = 0;
                     self.led_states.clear(); // Clear LED states when race starts
-
+                
                     let mut app_clone = self.clone();
                     tokio::spawn(async move {
                         app_clone.fetch_api_data().await.unwrap();
-                        app_clone.run_visualization().await;
+                
+                        // Only spawn run_visualization if data fetching is complete
+                        if app_clone.data_fetched {
+                            app_clone.run_visualization().await;
+                        } else {
+                            eprintln!("Data fetching was not completed successfully.");
+                        }
                     });
                 }
+
                 if ui.button("STOP").clicked() {
                     self.reset();
                 }
@@ -398,66 +420,82 @@ fn generate_update_frames(
     coordinates: &[LedCoordinate],
 ) -> Vec<UpdateFrame> {
     let mut frames: Vec<UpdateFrame> = vec![];
-    let mut frame = UpdateFrame {
-        drivers: [None; 20],
-    };
+    let mut timestamp_map: HashMap<DateTime<Utc>, Vec<LocationData>> = HashMap::new();
 
+    println!("Generating Update Frames");
+
+    // Group location data by timestamp
     for data in raw_data {
-        let (nearest_coord, _distance) = coordinates
-            .iter()
-            .map(|coord| {
-                let distance =
-                    ((data.x - coord.x_led).powi(2) + (data.y - coord.y_led).powi(2)).sqrt();
-                (coord, distance)
-            })
-            .min_by(|(_, dist_a), (_, dist_b)| {
-                dist_a
-                    .partial_cmp(dist_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap();
+        timestamp_map
+            .entry(data.date)
+            .or_insert_with(Vec::new)
+            .push(data.clone());
+    }
 
-        let driver_data = DriverData {
-            driver_number: data.driver_number,
-            led_num: nearest_coord.led_number,
+    // Iterate over each timestamp and create frames
+    for (_timestamp, data_group) in timestamp_map {
+        let mut frame = UpdateFrame {
+            drivers: [None; 20],
         };
 
-        // Insert the driver data into the frame
-        let mut inserted = false;
-        for slot in frame.drivers.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(driver_data);
-                inserted = true;
-                break;
-            }
-        }
+        for data in data_group {
+            let (nearest_coord, _distance) = coordinates
+                .iter()
+                .map(|coord| {
+                    let distance = ((data.x - coord.x_led).powi(2) + (data.y - coord.y_led).powi(2))
+                        .sqrt();
+                    (coord, distance)
+                })
+                .min_by(|(_, dist_a), (_, dist_b)| {
+                    dist_a
+                        .partial_cmp(dist_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
 
-        // If the frame is full, push it to the frames vector and start a new frame
-        if !inserted || frame.drivers.iter().all(|slot| slot.is_some()) {
-            frames.push(frame);
-            frame = UpdateFrame {
-                drivers: [None; 20],
+            let driver_data = DriverData {
+                driver_number: data.driver_number,
+                led_num: nearest_coord.led_number,
             };
 
-            // Ensure the new frame includes the driver data if it wasn't inserted
-            if !inserted {
-                for slot in frame.drivers.iter_mut() {
-                    if slot.is_none() {
-                        *slot = Some(driver_data);
-                        break;
+            // Insert the driver data into the frame
+            let mut inserted = false;
+            for slot in frame.drivers.iter_mut() {
+                if slot.is_none() {
+                    *slot = Some(driver_data);
+                    inserted = true;
+                    break;
+                }
+            }
+
+            // If the frame is full, push it to the frames vector and start a new frame
+            if !inserted || frame.drivers.iter().all(|slot| slot.is_some()) {
+                frames.push(frame);
+                frame = UpdateFrame {
+                    drivers: [None; 20],
+                };
+
+                // Ensure the new frame includes the driver data if it wasn't inserted
+                if !inserted {
+                    for slot in frame.drivers.iter_mut() {
+                        if slot.is_none() {
+                            *slot = Some(driver_data);
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Push the last frame if it has any data
-    if frame.drivers.iter().any(|slot| slot.is_some()) {
-        frames.push(frame);
+        // Push the last frame if it has any data
+        if frame.drivers.iter().any(|slot| slot.is_some()) {
+            frames.push(frame);
+        }
     }
-
+    println!("Frames data: {:?}", frames);
     frames
 }
+
 
 
 #[tokio::main]
