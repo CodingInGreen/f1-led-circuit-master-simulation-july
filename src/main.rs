@@ -414,6 +414,7 @@ impl App for PlotApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             for coord in &self.led_coordinates {
+                println!("Led Coordinates: {:?}", &self.led_coordinates);
                 let norm_x = ((coord.x_led - min_x) / width) as f32 * (ui.available_width() - 60.0); // Adjust for left/right margin
                 let norm_y = (ui.available_height() - 60.0)
                     - (((coord.y_led - min_y) / height) as f32 * (ui.available_height() - 60.0)); // Adjust for top/bottom margin
