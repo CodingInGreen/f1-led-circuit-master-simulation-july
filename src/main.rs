@@ -3,7 +3,11 @@ mod led_coords;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use driver_info::{get_driver_info, DriverInfo};
-use eframe::{egui, App, Frame};
+use iced::{
+    executor, Application, Command, Element, Length, Settings, Subscription,
+};
+use iced::widget::{button, column, container, row, slider, text};
+use iced::time;
 use led_coords::{read_coordinates, LedCoordinate};
 use reqwest::Client;
 use serde::de::{self, Deserializer};
@@ -12,8 +16,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::result::Result;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::{interval, sleep};
+use tokio::time::sleep;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocationData {
@@ -83,28 +88,42 @@ where
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+#[derive(Clone, Debug)]
+enum Message {
+    StartRace,
+    StopRace,
+    UpdateRace,
+    ApiDataFetched(Result<Vec<UpdateFrame>, FetchError>),
+    SpeedChanged(i32),
+}
+
+#[derive(Clone, Debug)]
+struct FetchError(Arc<dyn StdError + Send + Sync>);
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+
 #[derive(Clone)]
 struct PlotApp {
     update_rate_ms: u64,
     frames: VecDeque<UpdateFrame>,
     led_coordinates: Vec<LedCoordinate>,
     start_time: Instant,
-    race_time: f64, // Elapsed race time in seconds
+    race_time: f64,
     race_started: bool,
     driver_info: Vec<DriverInfo>,
     current_index: usize,
-    led_states: HashMap<usize, egui::Color32>, // Tracks the current state of the LEDs
-    speed: i32,                                // Playback speed multiplier
-    data_fetched: bool,                        // Indicates whether data fetching is complete
+    led_states: HashMap<usize, iced::Color>,
+    speed: i32,
+    data_fetched: bool,
 }
 
 impl PlotApp {
-    fn new(
-        update_rate_ms: u64,
-        frames: Vec<UpdateFrame>,
-        led_coordinates: Vec<LedCoordinate>,
-        driver_info: Vec<DriverInfo>,
-    ) -> PlotApp {
+    fn new(update_rate_ms: u64, frames: Vec<UpdateFrame>, led_coordinates: Vec<LedCoordinate>, driver_info: Vec<DriverInfo>) -> Self {
         PlotApp {
             update_rate_ms,
             frames: VecDeque::from(frames),
@@ -114,9 +133,9 @@ impl PlotApp {
             race_started: false,
             driver_info,
             current_index: 0,
-            led_states: HashMap::new(), // Initialize empty LED state tracking
+            led_states: HashMap::new(),
             speed: 1,
-            data_fetched: false, // Initialize to false
+            data_fetched: false,
         }
     }
 
@@ -125,15 +144,13 @@ impl PlotApp {
         self.race_time = 0.0;
         self.race_started = false;
         self.current_index = 0;
-        self.led_states.clear(); // Reset LED states
+        self.led_states.clear();
     }
 
     fn update_race(&mut self) {
         if !self.data_fetched {
             return;
         }
-
-        println!("Updating race...");
 
         if self.race_started {
             let elapsed = self.start_time.elapsed().as_secs_f64();
@@ -143,23 +160,12 @@ impl PlotApp {
             let next_index = (self.race_time / frame_duration).floor() as usize;
 
             if next_index >= self.frames.len() {
-                self.current_index = self.frames.len().saturating_sub(1); // Ensure it does not exceed frames length
+                self.current_index = self.frames.len().saturating_sub(1);
             } else {
                 self.current_index = next_index;
             }
 
-            println!(
-                "Current index: {}, Next index: {}",
-                self.current_index, next_index
-            );
-
-            // If current_index is 0, log a warning and do not call update_led_states
-            if self.current_index == 0 {
-                println!("Warning: current index ({}) is 0", self.current_index);
-                panic!("Panicking - we're about to be out of bounds.");
-            } else {
-                self.update_led_states();
-            }
+            self.update_led_states();
         }
     }
 
@@ -168,49 +174,32 @@ impl PlotApp {
 
         if self.current_index < self.frames.len() {
             let frame = &self.frames[self.current_index];
-            println!("Processing frame: {:?}", frame);
 
             for driver_data in &frame.drivers {
                 if let Some(driver) = driver_data {
-                    let color = self
-                        .driver_info
-                        .iter()
-                        .find(|&d| d.number == driver.driver_number)
-                        .map_or(egui::Color32::WHITE, |d| d.color);
+                    let color = self.driver_info.iter().find(|&d| d.number == driver.driver_number).map_or(iced::Color::WHITE, |d| {
+                        iced::Color::from_rgba8(d.color.r(), d.color.g(), d.color.b(), d.color.a() as f32 / 255.0)
+                    });
                     self.led_states.insert(driver.led_num, color);
                 }
             }
-        } else {
-            println!("Skipping update as current_index is out of bounds");
         }
-
-        // Debug statement to print the LED states
-        println!("LED States: {:?}", self.led_states);
     }
 
-    async fn fetch_api_data(&mut self) -> Result<(), Box<dyn StdError>> {
+    async fn fetch_api_data(&self) -> Result<Vec<UpdateFrame>, FetchError> {
         let session_key = "9149";
-        let driver_numbers = vec![
-            1, 2, 4, 10, 11, 14, 16, 18, 20, 22, 23, 24, 27, 31, 40, 44, 55, 63, 77, 81,
-        ];
+        let driver_numbers = vec![1, 2, 4, 10, 11, 14, 16, 18, 20, 22, 23, 24, 27, 31, 40, 44, 55, 63, 77, 81];
 
-        // Validate the initial start time and end time strings
         let initial_start_time_str = "2023-08-27T12:58:56.200Z";
-        let end_time_str = "2023-08-27T12:58:57.674Z"; // rate limit test
-
-        // Log the input strings for verification
-        println!("Parsing initial_start_time_str: {}", initial_start_time_str);
-        println!("Parsing end_time_str: {}", end_time_str);
+        let end_time_str = "2023-08-27T12:58:57.674Z";
 
         let initial_start_time = DateTime::parse_from_rfc3339(initial_start_time_str)
-            .map_err(|e| format!("Failed to parse initial_start_time: {}", e))?
+            .map_err(|e| FetchError(Arc::new(e)))?
             .with_timezone(&Utc);
-
         let end_time = DateTime::parse_from_rfc3339(end_time_str)
-            .map_err(|e| format!("Failed to parse end_time: {}", e))?
+            .map_err(|e| FetchError(Arc::new(e)))?
             .with_timezone(&Utc);
 
-        // Each API call should cover a time window of 0.35 seconds
         let time_window = ChronoDuration::milliseconds(1001);
 
         let client = Client::new();
@@ -220,10 +209,6 @@ impl PlotApp {
             let mut current_start_time = initial_start_time;
             while current_start_time < end_time {
                 let current_end_time = current_start_time + time_window;
-                println!(
-                    "Fetching data for driver {} from {} to {}",
-                    driver_number, current_start_time, current_end_time
-                );
                 let url = format!(
                     "https://api.openf1.org/v1/location?session_key={}&driver_number={}&date>{}&date<{}",
                     session_key, driver_number, current_start_time.to_rfc3339(), current_end_time.to_rfc3339(),
@@ -233,28 +218,16 @@ impl PlotApp {
                 let mut success = false;
 
                 while retry_count < 6 && !success {
-                    let resp = client.get(&url).send().await?;
+                    let resp = client.get(&url).send().await.map_err(|e| FetchError(Arc::new(e)))?;
                     if resp.status().is_success() {
-                        let data: Vec<LocationData> = resp.json().await?;
-                        println!(
-                            "Fetched {} entries for driver {} from {} to {}",
-                            data.len(),
-                            driver_number,
-                            current_start_time,
-                            current_end_time
-                        );
+                        let data: Vec<LocationData> = resp.json().await.map_err(|e| FetchError(Arc::new(e)))?;
                         if !data.is_empty() {
                             all_data.extend(data.into_iter().filter(|d| d.x != 0.0 && d.y != 0.0));
                         } else {
-                            break; // Stop if no data is returned
+                            break;
                         }
                         success = true;
                     } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        eprintln!(
-                            "Failed to fetch data for driver {}: HTTP {} Too Many Requests",
-                            driver_number,
-                            resp.status()
-                        );
                         retry_count += 1;
                         let backoff_time = match retry_count {
                             1 => Duration::from_secs(2),
@@ -264,23 +237,10 @@ impl PlotApp {
                             5 => Duration::from_secs(32),
                             _ => Duration::from_secs(64),
                         };
-                        eprintln!("Retrying in {:?}...", backoff_time);
-                        sleep(backoff_time).await; // Exponential backoff
+                        sleep(backoff_time).await;
                     } else {
-                        eprintln!(
-                            "Failed to fetch data for driver {}: HTTP {}",
-                            driver_number,
-                            resp.status()
-                        );
                         break;
                     }
-                }
-
-                if !success {
-                    eprintln!(
-                        "Failed to fetch data for driver {} after {} retries",
-                        driver_number, retry_count
-                    );
                 }
 
                 current_start_time = current_end_time;
@@ -289,206 +249,164 @@ impl PlotApp {
 
         all_data.sort_by_key(|d| d.date);
 
-        // Print statement indicating all data has been fetched and dump data contents
-        println!("All data has been successfully fetched.");
-        println!("Data contents: {:#?}", all_data);
-
-        let frames = generate_update_frames(&all_data, &self.led_coordinates);
-        self.frames.extend(frames);
-
-        // Set data_fetched to true after fetching is complete
-        self.data_fetched = true;
-
-        // Set current_index based on the fetched frames
-        if !self.frames.is_empty() {
-            self.current_index = 1; // Set to 1 to ensure visualization starts
-        } else {
-            self.current_index = 0; // Ensure it is 0 if no frames are available
-        }
-
-        Ok(())
-    }
-
-    async fn run_visualization(&mut self) {
-        println!("Running Visualization...");
-        let mut interval = interval(Duration::from_millis(self.update_rate_ms));
-        while self.race_started {
-            interval.tick().await;
-            self.update_race();
-            if !self.frames.is_empty() {
-                self.frames.pop_front();
-            }
-        }
+        Ok(generate_update_frames(&all_data, &self.led_coordinates))
     }
 }
 
-impl App for PlotApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        self.update_race();
+impl Application for PlotApp {
+    type Executor = executor::Default;
+    type Message = Message;
+    type Flags = ();
 
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Background,
-            egui::Id::new("layer"),
-        ));
+    fn new(_flags: ()) -> (Self, Command<Message>) {
+        let coordinates = read_coordinates().expect("Failed to read coordinates");
+        let driver_info = get_driver_info();
 
-        let (min_x, max_x) = self
-            .led_coordinates
-            .iter()
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), coord| {
-                (min.min(coord.x_led), max.max(coord.x_led))
-            });
-        let (min_y, max_y) = self
-            .led_coordinates
-            .iter()
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), coord| {
-                (min.min(coord.y_led), max.max(coord.y_led))
-            });
+        (PlotApp::new(10000, vec![], coordinates, driver_info), Command::none())
+    }
 
-        let width = max_x - min_x;
-        let height = max_y - min_y;
+    fn title(&self) -> String {
+        String::from("F1-LED-CIRCUIT SIMULATION")
+    }
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.separator();
-                ui.label(format!(
-                    "Race Time: {:02}:{:02}:{:05.2}",
-                    (self.race_time / 3600.0).floor() as u32, // hours
-                    ((self.race_time % 3600.0) / 60.0).floor() as u32, // minutes
-                    self.race_time % 60.0 // seconds with milliseconds
-                ));
-                ui.separator();
+    type Theme = iced::Theme;
 
-                if ui.button("START").clicked() {
-                    self.race_started = true;
-                    self.start_time = Instant::now();
-                    self.current_index = 0;
-                    self.led_states.clear(); // Clear LED states when race starts
-                
-                    let mut app_clone = self.clone();
-                    tokio::spawn(async move {
-                        app_clone.fetch_api_data().await.unwrap();
-                
-                        // Only spawn run_visualization if data fetching is complete and current_index is not 0
-                        if app_clone.data_fetched && app_clone.current_index != 0 {
-                            app_clone.run_visualization().await;
-                        } else {
-                            eprintln!("Data fetching was not completed successfully or current_index is 0.");
+    fn update(&mut self, message: Message) -> Command<Message> {
+        match message {
+            Message::StartRace => {
+                self.race_started = true;
+                self.start_time = Instant::now();
+                self.current_index = 0;
+                self.led_states.clear();
+
+                Command::perform(
+                    {
+                        let app = self.clone();
+                        async move {
+                            let frames = app.fetch_api_data().await;
+                            Message::ApiDataFetched(frames)
                         }
-                    });
-                }
-
-                if ui.button("STOP").clicked() {
-                    self.reset();
-                }
-
-                ui.label("PLAYBACK SPEED");
-                ui.add(egui::Slider::new(&mut self.speed, 1..=5));
-            });
-        });
-
-        egui::SidePanel::right("legend_panel").show(ctx, |ui| {
-            ui.vertical(|ui| {
-                let style = ui.style_mut();
-                style
-                    .text_styles
-                    .get_mut(&egui::TextStyle::Body)
-                    .unwrap()
-                    .size = 8.0; // Set the font size to 8.0 (or any other size you prefer)
-
-                for driver in &self.driver_info {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{}: {} ({})",
-                            driver.number, driver.name, driver.team
-                        ));
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(5.0, 5.0)),
-                            0.0,
-                            driver.color,
-                        );
-                        ui.add_space(5.0); // Space between legend items
-                    });
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            for coord in &self.led_coordinates {
-                println!("Led Coordinates: {:?}", &self.led_coordinates);
-                let norm_x = ((coord.x_led - min_x) / width) as f32 * (ui.available_width() - 60.0); // Adjust for left/right margin
-                let norm_y = (ui.available_height() - 60.0)
-                    - (((coord.y_led - min_y) / height) as f32 * (ui.available_height() - 60.0)); // Adjust for top/bottom margin
-
-                painter.rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::pos2(norm_x + 30.0, norm_y + 30.0), // Adjust position to include margins
-                        egui::vec2(20.0, 20.0),
-                    ),
-                    egui::Rounding::same(0.0),
-                    egui::Color32::BLACK,
-                );
-
-                if let Some(&color) = self.led_states.get(&coord.led_number) {
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(norm_x + 30.0, norm_y + 30.0), // Adjust position to include margins
-                            egui::vec2(20.0, 20.0),
-                        ),
-                        egui::Rounding::same(0.0),
-                        color,
-                    );
-                }
+                    },
+                    |result| result,
+                )
             }
-        });
+            Message::StopRace => {
+                self.reset();
+                Command::none()
+            }
+            Message::UpdateRace => {
+                self.update_race();
+                Command::none()
+            }
+            Message::ApiDataFetched(result) => match result {
+                Ok(frames) => {
+                    self.frames.extend(frames);
+                    self.data_fetched = true;
+                    Command::none()
+                }
+                Err(_) => Command::none(),
+            },
+            Message::SpeedChanged(speed) => {
+                self.speed = speed;
+                Command::none()
+            }
+        }
+    }
 
-        ctx.request_repaint(); // Request the GUI to repaint
+    fn view(&self) -> Element<Message> {
+        let content = column![
+            row![
+                button("Start").on_press(Message::StartRace),
+                button("Stop").on_press(Message::StopRace),
+                text(format!(
+                    "Race Time: {:02}:{:02}:{:05.2}",
+                    (self.race_time / 3600.0).floor() as u32,
+                    ((self.race_time % 3600.0) / 60.0).floor() as u32,
+                    self.race_time % 60.0
+                )),
+                text("Playback Speed:"),
+                slider(1..=5, self.speed, Message::SpeedChanged)
+            ],
+            text("Driver Info:"),
+            column(
+                self.driver_info
+                    .iter()
+                    .map(|driver| {
+                        row![
+                            text(format!("{}: {} ({})", driver.number, driver.name, driver.team)),
+                            container(text(" ")).width(Length::Fixed(10.0)).style(ContainerStyle {
+                                color: iced::Color::from_rgba8(driver.color.r(), driver.color.g(), driver.color.b(), driver.color.a() as f32 / 255.0),
+                            })
+                        ]
+                    })
+                    .collect::<Vec<_>>()
+            ),
+            text("LED Display:"),
+            container(column(
+                self.led_coordinates.iter().map(|coord| {
+                    container(text(" ")).width(Length::Fixed(20.0)).height(Length::Fixed(20.0)).style(ContainerStyle {
+                        color: *self.led_states.get(&coord.led_number).unwrap_or(&iced::Color::BLACK),
+                    })
+                }).collect::<Vec<_>>()
+            )).center_x().center_y()
+        ]
+        .into();
+
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .center_y()
+            .into()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        if self.race_started {
+            time::every(Duration::from_millis(self.update_rate_ms)).map(|_| Message::UpdateRace)
+        } else {
+            Subscription::none()
+        }
     }
 }
 
-fn generate_update_frames(
-    raw_data: &[LocationData],
-    coordinates: &[LedCoordinate],
-) -> Vec<UpdateFrame> {
+struct ContainerStyle {
+    color: iced::Color,
+}
+
+impl iced::widget::container::StyleSheet for ContainerStyle {
+    fn style(&self) -> iced::widget::container::Style {
+        iced::widget::container::Style {
+            background: Some(iced::Background::Color(self.color)),
+            ..Default::default()
+        }
+    }
+}
+
+fn generate_update_frames(raw_data: &[LocationData], coordinates: &[LedCoordinate]) -> Vec<UpdateFrame> {
     let mut frames: Vec<UpdateFrame> = vec![];
     let mut timestamp_map: HashMap<DateTime<Utc>, Vec<LocationData>> = HashMap::new();
 
-    println!("Generating Update Frames");
-
-    // Group location data by timestamp
     for data in raw_data {
-        timestamp_map
-            .entry(data.date)
-            .or_insert_with(Vec::new)
-            .push(data.clone());
+        timestamp_map.entry(data.date).or_insert_with(Vec::new).push(data.clone());
     }
 
-    // Iterate over each timestamp and create frames
     for (_timestamp, data_group) in timestamp_map {
-        let mut frame = UpdateFrame {
-            drivers: [None; 20],
-        };
+        let mut frame = UpdateFrame { drivers: [None; 20] };
 
         for data in data_group {
             let (nearest_coord, _distance) = coordinates
                 .iter()
                 .map(|coord| {
-                    let distance =
-                        ((data.x - coord.x_led).powi(2) + (data.y - coord.y_led).powi(2)).sqrt();
+                    let distance = ((data.x - coord.x_led).powi(2) + (data.y - coord.y_led).powi(2)).sqrt();
                     (coord, distance)
                 })
                 .min_by(|(_, dist_a), (_, dist_b)| {
-                    dist_a
-                        .partial_cmp(dist_b)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    dist_a.partial_cmp(dist_b).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
 
-            let driver_data = DriverData {
-                driver_number: data.driver_number,
-                led_num: nearest_coord.led_number,
-            };
+            let driver_data = DriverData { driver_number: data.driver_number, led_num: nearest_coord.led_number };
 
-            // Insert the driver data into the frame
             let mut inserted = false;
             for slot in frame.drivers.iter_mut() {
                 if slot.is_none() {
@@ -498,14 +416,10 @@ fn generate_update_frames(
                 }
             }
 
-            // If the frame is full, push it to the frames vector and start a new frame
             if !inserted || frame.drivers.iter().all(|slot| slot.is_some()) {
                 frames.push(frame);
-                frame = UpdateFrame {
-                    drivers: [None; 20],
-                };
+                frame = UpdateFrame { drivers: [None; 20] };
 
-                // Ensure the new frame includes the driver data if it wasn't inserted
                 if !inserted {
                     for slot in frame.drivers.iter_mut() {
                         if slot.is_none() {
@@ -517,28 +431,15 @@ fn generate_update_frames(
             }
         }
 
-        // Push the last frame if it has any data
         if frame.drivers.iter().any(|slot| slot.is_some()) {
             frames.push(frame);
         }
     }
-    println!("Frames data: {:?}", frames);
+
     frames
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
-    let coordinates = read_coordinates()?;
-    let driver_info = get_driver_info();
-
-    let app = PlotApp::new(10000, vec![], coordinates, driver_info);
-
-    let native_options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "F1-LED-CIRCUIT SIMULATION",
-        native_options,
-        Box::new(|_cc| Box::new(app)),
-    )?;
-
-    Ok(())
+    PlotApp::run(Settings::default()).map_err(|e| Box::new(e) as Box<dyn StdError>)
 }
