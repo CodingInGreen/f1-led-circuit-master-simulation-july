@@ -4,7 +4,7 @@ mod led_coords;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use driver_info::{get_driver_info, DriverInfo};
 use iced::{
-    executor, Application, Command, Element, Length, Settings, Subscription,
+    executor, Application, Command, Element, Length, Settings, Subscription, Theme,
 };
 use iced::widget::{button, column, container, row, slider, text};
 use iced::time;
@@ -105,7 +105,6 @@ impl std::fmt::Display for FetchError {
         write!(f, "{}", self.0)
     }
 }
-
 
 #[derive(Clone)]
 struct PlotApp {
@@ -279,16 +278,7 @@ impl Application for PlotApp {
                 self.current_index = 0;
                 self.led_states.clear();
 
-                Command::perform(
-                    {
-                        let app = self.clone();
-                        async move {
-                            let frames = app.fetch_api_data().await;
-                            Message::ApiDataFetched(frames)
-                        }
-                    },
-                    |result| result,
-                )
+                Command::none()
             }
             Message::StopRace => {
                 self.reset();
@@ -298,14 +288,9 @@ impl Application for PlotApp {
                 self.update_race();
                 Command::none()
             }
-            Message::ApiDataFetched(result) => match result {
-                Ok(frames) => {
-                    self.frames.extend(frames);
-                    self.data_fetched = true;
-                    Command::none()
-                }
-                Err(_) => Command::none(),
-            },
+            Message::ApiDataFetched(_) => {
+                Command::none()
+            }
             Message::SpeedChanged(speed) => {
                 self.speed = speed;
                 Command::none()
@@ -328,27 +313,9 @@ impl Application for PlotApp {
                 slider(1..=5, self.speed, Message::SpeedChanged)
             ],
             text("Driver Info:"),
-            column(
-                self.driver_info
-                    .iter()
-                    .map(|driver| {
-                        row![
-                            text(format!("{}: {} ({})", driver.number, driver.name, driver.team)),
-                            container(text(" ")).width(Length::Fixed(10.0)).style(ContainerStyle {
-                                color: iced::Color::from_rgba8(driver.color.r(), driver.color.g(), driver.color.b(), driver.color.a() as f32 / 255.0),
-                            })
-                        ]
-                    })
-                    .collect::<Vec<_>>()
-            ),
             text("LED Display:"),
-            container(column(
-                self.led_coordinates.iter().map(|coord| {
-                    container(text(" ")).width(Length::Fixed(20.0)).height(Length::Fixed(20.0)).style(ContainerStyle {
-                        color: *self.led_states.get(&coord.led_number).unwrap_or(&iced::Color::BLACK),
-                    })
-                }).collect::<Vec<_>>()
-            )).center_x().center_y()
+            text(if self.race_started { "Race started!" } else { "Race stopped." }),
+            text(format!("Current speed: {}", self.speed))
         ]
         .into();
 
@@ -369,13 +336,11 @@ impl Application for PlotApp {
     }
 }
 
-struct ContainerStyle {
-    color: iced::Color,
-}
-
 impl iced::widget::container::StyleSheet for ContainerStyle {
-    fn style(&self) -> iced::widget::container::Style {
-        iced::widget::container::Style {
+    type Style = iced::Theme;
+
+    fn appearance(&self, _style: &Self::Style) -> iced::widget::container::Appearance {
+        iced::widget::container::Appearance {
             background: Some(iced::Background::Color(self.color)),
             ..Default::default()
         }
